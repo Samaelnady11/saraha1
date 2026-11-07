@@ -1,0 +1,1 @@
+export {authcontroller} from './auth/auth.controller.js';
