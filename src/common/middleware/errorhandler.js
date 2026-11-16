@@ -1,16 +1,28 @@
 export const globalErrorHandler = (err, req, res, next) => {
-  let status = err.status || 500;
-  let message = err.message || 'Internal server error';
-
-  if (err.name === 'ValidationError') {
-    status = 400;
-    message = Object.values(err.errors).map((e) => e.message).join(', ');
+  if (res.headersSent) {
+    return next(err)
   }
 
+  const errorStatus = err.statusCode || err.status
+  let statusCode = 500
   if (err.code === 11000) {
-    status = 409;
-    message = `${Object.keys(err.keyValue)[0]} already exists`;
+    statusCode = 409
+  } else if (err.name === "ValidationError" || err.name === "CastError") {
+    statusCode = 400
+  } else if (
+    Number.isInteger(errorStatus) &&
+    errorStatus >= 400 &&
+    errorStatus <= 599
+  ) {
+    statusCode = errorStatus
   }
+  const isProduction = process.env.NODE_ENV === "production"
 
-  res.status(status).json({ message });
-};
+  res.status(statusCode).json({
+    message:
+      isProduction && statusCode >= 500
+        ? "Internal Server Error"
+        : err.message || "Internal Server Error",
+    ...(!isProduction ? { stack: err.stack } : {}),
+  })
+}
