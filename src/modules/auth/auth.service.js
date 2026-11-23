@@ -1,186 +1,233 @@
 
-import { OAuth2Client } from 'google-auth-library';
-
-import { UserModel } from '../../DB/model/user.model.js';
 import {
-  ConflictException,
-  UnauthorizedException,
-} from '../../common/utils/exceptions.js';
+    cacheKeys,
+    cacheService,
+    createTokens,
+    emailEvents,
+    EmailEventsEnum,
+    exceptions,
+    HashEnum,
+    myCompare,
+    myHash,
+    ProviderEnum
+} from "../../common/index.js";
 
-import { myhash, mycompare } from '../../common/security/hash.js';
-import { myencrypt, mydecrypt } from '../../common/security/encrypt.js';
-import { createTokens, verifyToken } from '../../common/security/jwt.js';
+import { encryption } from "../../common/security/encrypt.js";
+import { mydecrypt } from "../../common/security/encrypt.js";
+import configService from "../../config/config.service.js";
+import ur from "../../DB/repo/user.repo.js";
+import { OAuth2Client } from "google-auth-library";
+import { verifyToken } from "../../common/security/jwt.js";
 
-import {
-  JWT_REFRESH_SECRET,
-  JWT_ACCESS_EXP,
-  GOOGLE_CLIENT_ID,
-} from '../../config/config.service.js';
+const client = new OAuth2Client(configService.GOOGLE_CLIENT_ID);
 
-// Helper functions
-
+// Helper
 const getUserData = (user) => {
-  const result = user.toObject();
+    const result = user.toObject ? user.toObject() : { ...user };
 
-  delete result.password;
+    delete result.password;
 
-  if (result.phone) {
-    result.phone = mydecrypt(result.phone);
-  }
+    if (result.phone) {
+        result.phone = mydecrypt(result.phone);
+    }
 
-  return result;
-};
-
-const createAuthResult = (user) => {
-  const result = getUserData(user);
-  const tokens = createTokens(user);
-
-  return {
-    user: result,
-    ...tokens,
-  };
+    return result;
 };
 
 // Signup
-
 export const signup = async (data) => {
-  const exists = await UserModel.findOne({ email: data.email });
+    const exists = await ur.findOne({
+        filter: { email: data.email },
+        projection: { email: 1 }
+    });
 
-  if (exists) {
-    throw new ConflictException('User already exists');
-  }
+    if (exists) exceptions.ConflictException("user already exists");
 
-  const user = await UserModel.create({
-    ...data,
-    password: await myhash({ plainText: data.password }),
-    phone: myencrypt(data.phone),
-  });
+    const { confirmPassword, ...userData } = data;
 
-  return getUserData(user);
+    userData.password = await myHash({
+        plaintext: userData.password,
+        lib: HashEnum.argon
+    });
+
+    userData.phone = encryption(userData.phone);
+
+    const user = await ur.create({ data: userData });
+
+    const otp = Math.trunc(Math.random() * 10000)
+        .toString()
+        .padStart(4, "5");
+
+    await cacheService.set({
+        key: cacheKeys.userOtpKey({ userId: user._id.toString() }),
+        value: otp,
+        ttl: 600
+    });
+
+    emailEvents.emit(EmailEventsEnum.signup, {
+        receivers: { to: user.email },
+        otp
+    });
+
+    return getUserData(user);
 };
 
 // Login
-
 export const login = async ({ email, password }) => {
-  const user = await UserModel.findOne({
-    email,
-    deletedAt: null,
-  }).select('+password');
+    const user = await ur.findOne({
+        filter: { email },
+        projection: {
+            email: 1,
+            password: 1,
+            role: 1,
+            confirmEmail: 1,
+            phone: 1,
+            userName: 1
+        },
+        options: { lean: true }
+    });
 
-  if (!user) {
-    throw new UnauthorizedException('Invalid email or password');
-  }
+    if (!user) exceptions.NotFoundException("user not found");
 
-  const matchPassword = await mycompare({
-    plainText: password,
-    encrypted: user.password,
-  });
+    if (!user.confirmEmail) {
+        exceptions.ForbiddenException("user not confirmed");
+    }
 
-  if (!matchPassword) {
-    throw new UnauthorizedException('Invalid email or password');
-  }
+    const matchPassword = await myCompare({
+        plaintext: password,
+        encrypted: user.password,
+        lib: HashEnum.argon
+    });
 
-  return createAuthResult(user);
+    if (!matchPassword) exceptions.NotFoundException("user not found");
+
+    return createTokens({
+        options: {
+            subject: user.id || user._id.toString(),
+            issuer: "ali",
+            audience: [user.role]
+        },
+        role: user.role
+    });
 };
 
 // Google Login
+export const loginWithGmail = async (data) => {
+    let ticket;
 
-export const googleLogin = async ({ idToken, credential } = {}) => {
-  if (!GOOGLE_CLIENT_ID) {
-    throw new Error('Google login is not configured');
-  }
+    try {
+        ticket = await client.verifyIdToken({
+            idToken: data.idToken,
+            audience: configService.GOOGLE_CLIENT_ID
+        });
+    } catch {
+        exceptions.UnauthorizedException("Invalid Google ID token");
+    }
 
-  const submittedToken = idToken || credential;
+    const payload = ticket.getPayload();
 
-  if (typeof submittedToken !== 'string' || !submittedToken) {
-    throw new Error('Google ID token is required');
-  }
+    if (
+        !payload?.sub ||
+        !payload.email ||
+        payload.email_verified !== true
+    ) {
+        exceptions.UnauthorizedException("this email is not verified");
+    }
 
-  let ticket;
+    const email = payload.email.trim().toLowerCase();
 
-  try {
-    const client = new OAuth2Client(GOOGLE_CLIENT_ID);
-
-    ticket = await client.verifyIdToken({
-      idToken: submittedToken,
-      audience: GOOGLE_CLIENT_ID,
+    let user = await ur.findOne({
+        filter: { email }
     });
-  } catch {
-    throw new UnauthorizedException('Invalid Google ID token');
-  }
 
-  const googleUser = ticket.getPayload();
+    let status = 200;
 
-  if (
-    !googleUser?.sub ||
-    !googleUser.email ||
-    googleUser.email_verified !== true
-  ) {
-    throw new UnauthorizedException('Google account email must be verified');
-  }
+    if (!user) {
+        user = await ur.create({
+            data: {
+                email,
+                image: payload.picture,
+                userName: payload.name,
+                googleId: payload.sub,
+                provider: ProviderEnum.google,
+                confirmEmail: new Date()
+            }
+        });
 
-  const email = googleUser.email.trim().toLowerCase();
+        status = 201;
+    }
 
-  let user = await UserModel.findOne({
-    $or: [
-      { googleId: googleUser.sub },
-      { email },
-    ],
-    deletedAt: null,
-  });
-
-  if (!user) {
-    const [givenName, ...familyNames] =
-      (googleUser.name || '').trim().split(/\s+/);
-
-    user = await UserModel.create({
-      firstName: googleUser.given_name || givenName || 'Google',
-      lastName: googleUser.family_name || familyNames.join(' ') || 'User',
-      email,
-      googleId: googleUser.sub,
-    });
-  } else if (user.googleId && user.googleId !== googleUser.sub) {
-    throw new ConflictException(
-      'This email is already linked to another Google account'
-    );
-  } else if (!user.googleId) {
-    user.googleId = googleUser.sub;
-    await user.save();
-  }
-
-  return createAuthResult(user);
+    return {
+        tokens: createTokens({
+            options: {
+                subject: user.id || user._id.toString(),
+                issuer: "ali",
+                audience: [user.role]
+            },
+            role: user.role
+        }),
+        status
+    };
 };
 
 // Rotate Token
+export const rotateToken = async (user, payload) => {
+    const accessIAT = payload.iat * 1000;
+    const accessExpIn = configService.JWT_ACCESS_EXP * 1000;
+    const accessExpAt = accessIAT + accessExpIn;
 
-export const rotateToken = async (token = '') => {
-  const refreshToken = token.replace(/^Bearer\s+/i, '').trim();
+    if (Date.now() < accessExpAt) {
+        exceptions.ConflictException("access token still valid");
+    }
 
-  let payload;
-
-  try {
-    payload = verifyToken({
-      token: refreshToken,
-      secret: JWT_REFRESH_SECRET,
+    const tokens = createTokens({
+        options: {
+            subject: user.id || user._id.toString(),
+            issuer: "ali",
+            audience: [user.role]
+        },
+        role: user.role
     });
-  } catch {
-    throw new UnauthorizedException('Invalid or expired refresh token');
-  }
 
-  const now = Math.floor(Date.now() / 1000);
+    return tokens;
+};
 
-  if (now < payload.iat + JWT_ACCESS_EXP) {
-    throw new ConflictException('access token still valid');
-  }
+// Logout
+export const logout = async (payload) => {
+    const { exp, jti, sub } = payload;
 
-  const user = await UserModel.findOne({
-    _id: payload.id,
-    deletedAt: null,
-  });
+    const nowInSec = Math.ceil(Date.now() / 1000);
+    const ttl = exp - nowInSec;
 
-  if (!user) {
-    throw new UnauthorizedException('User not found');
-  }
+    if (ttl > 0) {
+        await cacheService.set({
+            key: cacheKeys.userRevokeKey({ userId: sub, jti }),
+            value: jti,
+            ttl
+        });
+    }
 
-  return createTokens(user);
+    return { ...payload, nowInSec, ttl };
+};
+
+// Confirm Email
+export const confirmEmail = async ({ email, otp }) => {
+    const user = await ur.findOne({ filter: { email } });
+
+    if (!user) exceptions.NotFoundException("user not found");
+
+    const storedOtp = await cacheService.get(
+        cacheKeys.userOtpKey({ userId: user._id.toString() })
+    );
+
+    if (otp !== storedOtp) {
+        exceptions.BadRequestException("wrong otp");
+    }
+
+    user.confirmEmail = new Date();
+    await user.save();
+
+    await cacheService.del([
+        cacheKeys.userOtpKey({ userId: user._id.toString() })
+    ]);
 };

@@ -1,49 +1,119 @@
-import { verifyToken } from '../security/jwt.js';
-import { UnauthorizedException, asyncHandler } from '../utils/exceptions.js';
-import { UserModel } from '../../DB/model/user.model.js';
-import { TokenType } from '../enums/token-type.enum.js';
-import { exceptions } from "../utils/exceptions.js"
-import { verifyToken } from "../security/index.js"
+import ur from "../../DB/repo/user.repo.js";import {
+  AuthEnum,
+  cacheKeys,
+  cacheService,
+  myCompare,
+  TokenTypeEnum,
+} from "../index.js";
 
-export const authentication = asyncHandler(async (req, res, next) => {
-  const header = req.headers.authorization || '';
-  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
-  if (!token) throw new UnauthorizedException('Token is required');
+import { verifyToken } from "../security/jwt.js";
+import {
+  asyncHandler,
+  BadRequestException,
+  NotFoundException,
+  UnauthorizedException,
+} from "../utils/exceptions.js";
 
-  let payload;
-  try {
-    payload = verifyToken({ token });
-  } catch {
-    throw new UnauthorizedException('Invalid or expired token');
-  }
+export const auth = ({ tokenType = TokenTypeEnum.ACCESS } = {}) => {
+  return asyncHandler(async (req, res, next) => {
+    const authorization = req.headers.authorization;
 
-  const user = await UserModel.findOne({ _id: payload.id, deletedAt: null });
-  if (!user) throw new UnauthorizedException('User not found');
+    if (!authorization) {
+      throw new BadRequestException("Token not provided");
+    }
 
-  req.user = user;
-  next();
-});
-export const authenticate = (req, res, next) => {
-  const authorization = req.headers.authorization
-  const match =
-    typeof authorization === "string" &&
-    authorization.match(/^Bearer\s+(\S+)$/i)
+    const [prefix, token] = authorization.split(" ");
 
-  if (!match) {
-    exceptions.unauthorized("A Bearer token is required")
-  }
+    if (!token) {
+      throw new BadRequestException("Token not provided");
+    }
 
-  let payload
-  try {
-    payload = verifyToken({ token: match[1] })
-  } catch {
-    exceptions.unauthorized("Invalid or expired token")
-  }
+    switch (prefix) {
+      // ==================== Basic Authentication ====================
+      case AuthEnum.Basic: {
+        const data = Buffer.from(token, "base64").toString();
 
-  if (!payload || typeof payload !== "object" || typeof payload.sub !== "string") {
-    exceptions.unauthorized("Invalid token payload")
-  }
+        const [email, password] = data.split(":");
 
-  req.auth = payload
-  next()
-}
+        const user = await ur.findOne({
+          filter: { email },
+        });
+
+        if (!user) {
+          throw new NotFoundException("User not found");
+        }
+
+        const correctPassword = await myCompare({
+          plaintext: password,
+          encrypted: user.password,
+        });
+
+        if (!correctPassword) {
+          throw new UnauthorizedException("Invalid email or password");
+        }
+
+        req.user = user;
+
+        return next();
+      }
+
+      // ==================== Bearer Authentication ====================
+      case AuthEnum.Bearer: {
+        let payload;
+
+        try {
+          payload = verifyToken({
+            token,
+            tokenType,
+          });
+        } catch {
+          throw new UnauthorizedException("Invalid or expired token");
+        }
+
+        // Validate token payload
+        if (
+          !payload ||
+          typeof payload !== "object" ||
+          typeof (payload.sub ?? payload.id) !== "string"
+        ) {
+          throw new UnauthorizedException("Invalid token payload");
+        }
+
+        // Support both sub and id depending on the token payload
+        const userId = payload.sub ?? payload.id;
+
+        // Check if token is revoked
+        if (payload.jti) {
+          const isRevoked = await cacheService.get(
+            cacheKeys.userRevokeKey({
+              userId,
+              jti: payload.jti,
+            })
+          );
+
+          if (isRevoked) {
+            throw new UnauthorizedException("Token is revoked");
+          }
+        }
+
+        // Get user from database
+        const user = await ur.findById({
+          id: userId,
+        });
+
+        if (!user) {
+          throw new NotFoundException("User not found");
+        }
+
+        req.user = user;
+        req.payload = payload;
+        req.auth = payload;
+
+        return next();
+      }
+
+      default:
+        throw new BadRequestException("Invalid auth method");
+    }
+  });
+};

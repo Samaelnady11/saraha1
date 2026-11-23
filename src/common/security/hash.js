@@ -1,7 +1,7 @@
-
 import bcrypt from 'bcrypt';
 import argon2 from 'argon2';
 import { SALT_ROUNDS } from '../../config/config.service.js';
+
 export const HashEnum = Object.freeze({
   bcrypt: 'bcrypt',
   argon: 'argon',
@@ -14,7 +14,7 @@ export const myhash = async ({
 }) => {
   switch (lib) {
     case HashEnum.bcrypt: {
-      const salt = await bcrypt.genSalt(configService.SALT_ROUNDS, minor);
+      const salt = await bcrypt.genSalt(SALT_ROUNDS);
       return bcrypt.hash(plainText, salt);
     }
 

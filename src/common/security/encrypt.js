@@ -37,3 +37,7 @@ export const mydecrypt = (data) => {
     decipher.final(),
   ]).toString('utf8');
 };
+export {
+  myencrypt as encryption,
+  mydecrypt as decryption,
+};

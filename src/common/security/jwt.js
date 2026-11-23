@@ -1,51 +1,115 @@
-
-import jwt from 'jsonwebtoken';
-import {
-  JWT_ACCESS_SECRET,
-  JWT_REFRESH_SECRET,
-  JWT_ACCESS_EXP,
-  JWT_REFRESH_EXP,
-} from '../../config/config.service.js';
+import crypto from "node:crypto";
+import jwt from "jsonwebtoken";
+import configService from "../../config/config.service.js";
+import { TokenTypeEnum } from "../enums/tokenType.enum.js";
+import { RoleEnum } from "../enums/role.enum.js";
 
 export const createToken = ({
   payload = {},
   options = {},
-  secret = JWT_ACCESS_SECRET,
+  secret = configService.JWT_ACCESS_USER_SECRET,
 } = {}) => {
-  console.log('Inside createToken:', {
-    secretExists: !!secret,
-    secretType: typeof secret,
-    secretLength: secret?.length,
-  });
-
   return jwt.sign(payload, secret, options);
 };
 
-export const verifyToken = ({
-  token,
-  secret = JWT_ACCESS_SECRET,
-} = {}) => {
-  return jwt.verify(token, secret);
+// ==================== Role Secrets ====================
+
+const getRoleSecret = (role = RoleEnum.user) => {
+  switch (role) {
+    case RoleEnum.admin:
+      return {
+        access: configService.JWT_ACCESS_ADMIN_SECRET,
+        refresh: configService.JWT_REFRESH_ADMIN_SECRET,
+      };
+
+    default:
+      return {
+        access: configService.JWT_ACCESS_USER_SECRET,
+        refresh: configService.JWT_REFRESH_USER_SECRET,
+      };
+  }
 };
 
-export const createTokens = (user) => {
-  console.log('Creating access token');
+const getSecret = ({
+  tokenType = TokenTypeEnum.ACCESS,
+  role = RoleEnum.user,
+} = {}) => {
+  const secrets = getRoleSecret(role);
+
+  return tokenType === TokenTypeEnum.REFRESH
+    ? secrets.refresh
+    : secrets.access;
+};
+
+// ==================== Create Tokens ====================
+
+export const createTokens = (data = {}) => {
+  const isUserObject = data._id && !("payload" in data);
+
+  const payload = isUserObject
+    ? { id: data._id }
+    : data.payload || {};
+
+  const role = isUserObject
+    ? data.role || RoleEnum.user
+    : data.role || RoleEnum.user;
+
+  const options = data.options || {};
+
+  const secrets = getRoleSecret(role);
+  const jti = crypto.randomBytes(16).toString("hex");
 
   const accessToken = createToken({
-    payload: { id: user._id },
-    secret: JWT_ACCESS_SECRET,
-    options: { expiresIn: JWT_ACCESS_EXP },
+    payload,
+    options: {
+      ...options,
+      audience: role,
+      expiresIn: configService.JWT_ACCESS_EXP,
+      jwtid: jti,
+    },
+    secret: secrets.access,
   });
-
-  console.log('Access token created');
 
   const refreshToken = createToken({
-    payload: { id: user._id },
-    secret: JWT_REFRESH_SECRET,
-    options: { expiresIn: JWT_REFRESH_EXP },
+    payload,
+    options: {
+      ...options,
+      audience: role,
+      expiresIn: configService.JWT_REFRESH_EXP,
+      jwtid: jti,
+    },
+    secret: secrets.refresh,
   });
 
-  console.log('Refresh token created');
-
   return { accessToken, refreshToken };
+};
+
+// ==================== Verify Token ====================
+
+export const verifyToken = ({
+  token,
+  tokenType = TokenTypeEnum.ACCESS,
+} = {}) => {
+  const decoded = jwt.decode(token);
+
+  if (!decoded || typeof decoded === "string") {
+    throw new Error("Invalid token payload");
+  }
+
+  const audience = decoded.aud;
+
+  const role = Array.isArray(audience)
+    ? audience[0]
+    : audience;
+
+  if (!role) {
+    throw new Error("Token audience is missing");
+  }
+
+  const secret = getSecret({
+    tokenType,
+    role,
+  });
+
+  return jwt.verify(token, secret);
 };

@@ -1,8 +1,9 @@
-const genderEnum = {
-    male : 0,
-    female : 1
+export { GenderEnum as genderEnum } from "./gender.enum.js";
+const GenderEnum = {
+    male: 0,
+    female: 1
 }
 
-Object.freeze(genderEnum)
+Object.freeze(GenderEnum)
 
-export { genderEnum }
+export { GenderEnum }
